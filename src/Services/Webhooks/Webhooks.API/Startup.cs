@@ -1,26 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Data.Common;
-using System.IdentityModel.Tokens.Jwt;
-using System.Linq;
-using System.Reflection;
-using System.Threading;
-using System.Threading.Tasks;
-using Autofac;
+﻿using Autofac;
 using Autofac.Extensions.DependencyInjection;
 using Devspaces.Support;
 using HealthChecks.UI.Client;
-using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.ApplicationInsights.ServiceFabric;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.ServiceBus;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ;
@@ -30,8 +17,14 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.OpenApi.Models;
 using RabbitMQ.Client;
-using Swashbuckle.AspNetCore.Swagger;
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.IdentityModel.Tokens.Jwt;
+using System.Reflection;
+using System.Threading;
 using Webhooks.API.Infrastructure;
 using Webhooks.API.IntegrationEvents;
 using Webhooks.API.Services;
@@ -52,7 +45,7 @@ namespace Webhooks.API
         {
             services
                 .AddAppInsight(Configuration)
-                .AddCustomMVC(Configuration)
+                .AddCustomRouting(Configuration)
                 .AddCustomDbContext(Configuration)
                 .AddSwagger(Configuration)
                 .AddCustomHealthCheck(Configuration)
@@ -80,26 +73,30 @@ namespace Webhooks.API
 
             if (!string.IsNullOrEmpty(pathBase))
             {
-                loggerFactory.CreateLogger("init").LogDebug($"Using PATH BASE '{pathBase}'");
+                loggerFactory.CreateLogger("init").LogDebug("Using PATH BASE '{PathBase}'", pathBase);
                 app.UsePathBase(pathBase);
             }
 
-            app.UseHealthChecks("/hc", new HealthCheckOptions()
-            {
-                Predicate = _ => true,
-                ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
-            });
 
-            app.UseHealthChecks("/liveness", new HealthCheckOptions
-            {
-                Predicate = r => r.Name.Contains("self")
-            });
 
+            app.UseRouting();
             app.UseCors("CorsPolicy");
-
             ConfigureAuth(app);
 
-            app.UseMvcWithDefaultRoute();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapDefaultControllerRoute();
+                endpoints.MapControllers();
+                endpoints.MapHealthChecks("/hc", new HealthCheckOptions()
+                {
+                    Predicate = _ => true,
+                    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+                });
+                endpoints.MapHealthChecks("/liveness", new HealthCheckOptions
+                {
+                    Predicate = r => r.Name.Contains("self")
+                });
+            });
 
             app.UseSwagger()
               .UseSwaggerUI(c =>
@@ -114,14 +111,8 @@ namespace Webhooks.API
 
         protected virtual void ConfigureAuth(IApplicationBuilder app)
         {
-            /*
-            if (Configuration.GetValue<bool>("UseLoadTest"))
-            {
-                app.UseMiddleware<ByPassAuthMiddleware>();
-            }
-            */
-
             app.UseAuthentication();
+            app.UseAuthorization();
         }
 
         protected virtual void ConfigureEventBus(IApplicationBuilder app)
@@ -138,31 +129,17 @@ namespace Webhooks.API
         public static IServiceCollection AddAppInsight(this IServiceCollection services, IConfiguration configuration)
         {
             services.AddApplicationInsightsTelemetry(configuration);
-            var orchestratorType = configuration.GetValue<string>("OrchestratorType");
-
-            if (orchestratorType?.ToUpper() == "K8S")
-            {
-                // Enable K8s telemetry initializer
-                services.AddApplicationInsightsKubernetesEnricher();
-            }
-            if (orchestratorType?.ToUpper() == "SF")
-            {
-                // Enable SF telemetry initializer
-                services.AddSingleton<ITelemetryInitializer>((serviceProvider) =>
-                    new FabricTelemetryInitializer());
-            }
+            services.AddApplicationInsightsKubernetesEnricher();
 
             return services;
         }
 
-        public static IServiceCollection AddCustomMVC(this IServiceCollection services, IConfiguration configuration)
+        public static IServiceCollection AddCustomRouting(this IServiceCollection services, IConfiguration configuration)
         {
-            services.AddMvc(options =>
+            services.AddControllers(options =>
             {
                 options.Filters.Add(typeof(HttpGlobalExceptionFilter));
-            })
-                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2)
-                .AddControllersAsServices();
+            });
 
             services.AddCors(options =>
             {
@@ -179,20 +156,16 @@ namespace Webhooks.API
 
         public static IServiceCollection AddCustomDbContext(this IServiceCollection services, IConfiguration configuration)
         {
-            services.AddDbContext<WebhooksContext>(options =>
+            services.AddEntityFrameworkSqlServer()
+                .AddDbContext<WebhooksContext>(options =>
             {
                 options.UseSqlServer(configuration["ConnectionString"],
                                      sqlServerOptionsAction: sqlOptions =>
                                      {
                                          sqlOptions.MigrationsAssembly(typeof(Startup).GetTypeInfo().Assembly.GetName().Name);
                                          //Configuring Connection Resiliency: https://docs.microsoft.com/en-us/ef/core/miscellaneous/connection-resiliency 
-                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 10, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
+                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 15, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
                                      });
-
-                // Changing default behavior when client evaluation occurs to throw. 
-                // Default in EF Core would be to log a warning when client evaluation is performed.
-                options.ConfigureWarnings(warnings => warnings.Throw(RelationalEventId.QueryClientEvaluationWarning));
-                //Check Client vs. Server evaluation: https://docs.microsoft.com/en-us/ef/core/querying/client-eval
             });
 
             return services;
@@ -203,23 +176,27 @@ namespace Webhooks.API
             services.AddSwaggerGen(options =>
             {
                 options.DescribeAllEnumsAsStrings();
-                options.SwaggerDoc("v1", new Swashbuckle.AspNetCore.Swagger.Info
+                options.SwaggerDoc("v1", new OpenApiInfo
                 {
                     Title = "eShopOnContainers - Webhooks HTTP API",
                     Version = "v1",
-                    Description = "The Webhooks Microservice HTTP API. This is a simple webhooks CRUD registration entrypoint",
-                    TermsOfService = "Terms Of Service"
+                    Description = "The Webhooks Microservice HTTP API. This is a simple webhooks CRUD registration entrypoint"
                 });
 
-                options.AddSecurityDefinition("oauth2", new OAuth2Scheme
+                options.AddSecurityDefinition("oauth2", new OpenApiSecurityScheme
                 {
-                    Type = "oauth2",
-                    Flow = "implicit",
-                    AuthorizationUrl = $"{configuration.GetValue<string>("IdentityUrlExternal")}/connect/authorize",
-                    TokenUrl = $"{configuration.GetValue<string>("IdentityUrlExternal")}/connect/token",
-                    Scopes = new Dictionary<string, string>()
+                    Type = SecuritySchemeType.OAuth2,
+                    Flows = new OpenApiOAuthFlows()
                     {
-                        { "webhooks", "Webhooks API" }
+                        Implicit = new OpenApiOAuthFlow()
+                        {
+                            AuthorizationUrl = new Uri($"{configuration.GetValue<string>("IdentityUrlExternal")}/connect/authorize"),
+                            TokenUrl = new Uri($"{configuration.GetValue<string>("IdentityUrlExternal")}/connect/token"),
+                            Scopes = new Dictionary<string, string>()
+                            {
+                                {  "webhooks", "Webhooks API" }
+                            }
+                        }
                     }
                 });
 
@@ -230,8 +207,6 @@ namespace Webhooks.API
         }
         public static IServiceCollection AddEventBus(this IServiceCollection services, IConfiguration configuration)
         {
-            var subscriptionClientName = configuration["SubscriptionClientName"];
-
             if (configuration.GetValue<bool>("AzureServiceBusEnabled"))
             {
                 services.AddSingleton<IEventBus, EventBusServiceBus>(sp =>
@@ -242,7 +217,7 @@ namespace Webhooks.API
                     var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();
 
                     return new EventBusServiceBus(serviceBusPersisterConnection, logger,
-                        eventBusSubcriptionsManager, subscriptionClientName, iLifetimeScope);
+                        eventBusSubcriptionsManager, iLifetimeScope);
                 });
 
             }
@@ -250,6 +225,7 @@ namespace Webhooks.API
             {
                 services.AddSingleton<IEventBus, EventBusRabbitMQ>(sp =>
                 {
+                    var subscriptionClientName = configuration["SubscriptionClientName"];
                     var rabbitMQPersistentConnection = sp.GetRequiredService<IRabbitMQPersistentConnection>();
                     var iLifetimeScope = sp.GetRequiredService<ILifetimeScope>();
                     var logger = sp.GetRequiredService<ILogger<EventBusRabbitMQ>>();
@@ -309,9 +285,9 @@ namespace Webhooks.API
             {
                 services.AddSingleton<IServiceBusPersisterConnection>(sp =>
                 {
-                    var logger = sp.GetRequiredService<ILogger<DefaultServiceBusPersisterConnection>>();
                     var serviceBusConnection = new ServiceBusConnectionStringBuilder(configuration["EventBusConnection"]);
-                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, logger);
+                    var subscriptionClientName = configuration["SubscriptionClientName"];
+                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, subscriptionClientName);
                 });
             }
             else

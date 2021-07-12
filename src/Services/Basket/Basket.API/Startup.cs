@@ -1,24 +1,21 @@
 ﻿using Autofac;
 using Autofac.Extensions.DependencyInjection;
 using Basket.API.Infrastructure.Filters;
-using Basket.API.Infrastructure.Middlewares;
 using Basket.API.IntegrationEvents.EventHandling;
 using Basket.API.IntegrationEvents.Events;
+using GrpcBasket;
 using HealthChecks.UI.Client;
-
-using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.ApplicationInsights.ServiceFabric;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.ServiceBus;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBusServiceBus;
+using Microsoft.eShopOnContainers.Services.Basket.API.Controllers;
 using Microsoft.eShopOnContainers.Services.Basket.API.Infrastructure.Repositories;
 using Microsoft.eShopOnContainers.Services.Basket.API.IntegrationEvents.EventHandling;
 using Microsoft.eShopOnContainers.Services.Basket.API.IntegrationEvents.Events;
@@ -29,12 +26,13 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.OpenApi.Models;
 using RabbitMQ.Client;
 using StackExchange.Redis;
-using Swashbuckle.AspNetCore.Swagger;
 using System;
 using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
+using System.IO;
 
 namespace Microsoft.eShopOnContainers.Services.Basket.API
 {
@@ -47,21 +45,54 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
         public IConfiguration Configuration { get; }
 
-
         // This method gets called by the runtime. Use this method to add services to the container.
-        public IServiceProvider ConfigureServices(IServiceCollection services)
+        public virtual IServiceProvider ConfigureServices(IServiceCollection services)
         {
+            services.AddGrpc(options =>
+            {
+                options.EnableDetailedErrors = true;
+            });
+
             RegisterAppInsights(services);
 
-            // Add framework services.
-            services.AddMvc(options =>
+            services.AddControllers(options =>
                 {
                     options.Filters.Add(typeof(HttpGlobalExceptionFilter));
                     options.Filters.Add(typeof(ValidateModelStateFilter));
 
-                })
-                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2)
-                .AddControllersAsServices();
+                }) // Added for functional tests
+                .AddApplicationPart(typeof(BasketController).Assembly)
+                .AddJsonOptions(options => options.JsonSerializerOptions.WriteIndented = true);
+
+            services.AddSwaggerGen(options =>
+            {
+                options.DescribeAllEnumsAsStrings();
+                options.SwaggerDoc("v1", new OpenApiInfo
+                {
+                    Title = "eShopOnContainers - Basket HTTP API",
+                    Version = "v1",
+                    Description = "The Basket Service HTTP API"
+                });
+
+                options.AddSecurityDefinition("oauth2", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.OAuth2,
+                    Flows = new OpenApiOAuthFlows()
+                    {
+                        Implicit = new OpenApiOAuthFlow()
+                        {
+                            AuthorizationUrl = new Uri($"{Configuration.GetValue<string>("IdentityUrlExternal")}/connect/authorize"),
+                            TokenUrl = new Uri($"{Configuration.GetValue<string>("IdentityUrlExternal")}/connect/token"),
+                            Scopes = new Dictionary<string, string>()
+                            {
+                                { "basket", "Basket API" }
+                            }
+                        }
+                    }
+                });
+
+                options.OperationFilter<AuthorizeCheckOperationFilter>();
+            });
 
             ConfigureAuthService(services);
 
@@ -90,12 +121,11 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
             {
                 services.AddSingleton<IServiceBusPersisterConnection>(sp =>
                 {
-                    var logger = sp.GetRequiredService<ILogger<DefaultServiceBusPersisterConnection>>();
-
                     var serviceBusConnectionString = Configuration["EventBusConnection"];
                     var serviceBusConnection = new ServiceBusConnectionStringBuilder(serviceBusConnectionString);
 
-                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, logger);
+                    var subscriptionClientName = Configuration["SubscriptionClientName"];
+                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, subscriptionClientName);
                 });
             }
             else
@@ -132,31 +162,6 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
             RegisterEventBus(services);
 
-            services.AddSwaggerGen(options =>
-            {
-                options.DescribeAllEnumsAsStrings();
-                options.SwaggerDoc("v1", new Info
-                {
-                    Title = "Basket HTTP API",
-                    Version = "v1",
-                    Description = "The Basket Service HTTP API",
-                    TermsOfService = "Terms Of Service"
-                });
-
-                options.AddSecurityDefinition("oauth2", new OAuth2Scheme
-                {
-                    Type = "oauth2",
-                    Flow = "implicit",
-                    AuthorizationUrl = $"{Configuration.GetValue<string>("IdentityUrlExternal")}/connect/authorize",
-                    TokenUrl = $"{Configuration.GetValue<string>("IdentityUrlExternal")}/connect/token",
-                    Scopes = new Dictionary<string, string>()
-                    {
-                        { "basket", "Basket API" }
-                    }
-                });
-
-                options.OperationFilter<AuthorizeCheckOperationFilter>();
-            });
 
             services.AddCors(options =>
             {
@@ -178,10 +183,9 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
             return new AutofacServiceProvider(container.Build());
         }
-    
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
-        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory)
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env, ILoggerFactory loggerFactory)
         {
             //loggerFactory.AddAzureWebAppDiagnostics();
             //loggerFactory.AddApplicationInsights(app.ApplicationServices, LogLevel.Trace);
@@ -192,61 +196,66 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
                 app.UsePathBase(pathBase);
             }
 
-            app.UseHealthChecks("/hc", new HealthCheckOptions()
-            {
-                Predicate = _ => true,
-                ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
-            });
-
-            app.UseHealthChecks("/liveness", new HealthCheckOptions
-            {
-                Predicate = r => r.Name.Contains("self")
-            });
-
-            app.UseStaticFiles();          
-            app.UseCors("CorsPolicy");
-
-            ConfigureAuth(app);
-
-            app.UseMvcWithDefaultRoute();
-
             app.UseSwagger()
-               .UseSwaggerUI(c =>
+               .UseSwaggerUI(setup =>
                {
-                   c.SwaggerEndpoint($"{ (!string.IsNullOrEmpty(pathBase) ? pathBase : string.Empty) }/swagger/v1/swagger.json", "Basket.API V1");
-                   c.OAuthClientId ("basketswaggerui");
-                   c.OAuthAppName("Basket Swagger UI");
+                   setup.SwaggerEndpoint($"{ (!string.IsNullOrEmpty(pathBase) ? pathBase : string.Empty) }/swagger/v1/swagger.json", "Basket.API V1");
+                   setup.OAuthClientId("basketswaggerui");
+                   setup.OAuthAppName("Basket Swagger UI");
                });
 
-            ConfigureEventBus(app);
+            app.UseRouting();
+            app.UseCors("CorsPolicy");
+            ConfigureAuth(app);
 
+            app.UseStaticFiles();
+
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapGrpcService<BasketService>();
+                endpoints.MapDefaultControllerRoute();
+                endpoints.MapControllers();
+                endpoints.MapGet("/_proto/", async ctx =>
+                {
+                    ctx.Response.ContentType = "text/plain";
+                    using var fs = new FileStream(Path.Combine(env.ContentRootPath, "Proto", "basket.proto"), FileMode.Open, FileAccess.Read);
+                    using var sr = new StreamReader(fs);
+                    while (!sr.EndOfStream)
+                    {
+                        var line = await sr.ReadLineAsync();
+                        if (line != "/* >>" || line != "<< */")
+                        {
+                            await ctx.Response.WriteAsync(line);
+                        }
+                    }
+                });
+                endpoints.MapHealthChecks("/hc", new HealthCheckOptions()
+                {
+                    Predicate = _ => true,
+                    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+                });
+                endpoints.MapHealthChecks("/liveness", new HealthCheckOptions
+                {
+                    Predicate = r => r.Name.Contains("self")
+                });
+            });
+
+            ConfigureEventBus(app);
         }
 
         private void RegisterAppInsights(IServiceCollection services)
         {
             services.AddApplicationInsightsTelemetry(Configuration);
-            var orchestratorType = Configuration.GetValue<string>("OrchestratorType");
-            
-            if (orchestratorType?.ToUpper() == "K8S")
-            {
-                // Enable K8s telemetry initializer
-                services.AddApplicationInsightsKubernetesEnricher();
-            }
-            if (orchestratorType?.ToUpper() == "SF")
-            {
-                // Enable SF telemetry initializer
-                services.AddSingleton<ITelemetryInitializer>((serviceProvider) =>
-                    new FabricTelemetryInitializer());
-            }
+            services.AddApplicationInsightsKubernetesEnricher();
         }
 
         private void ConfigureAuthService(IServiceCollection services)
         {
             // prevent from mapping "sub" claim to nameidentifier.
-            JwtSecurityTokenHandler.DefaultInboundClaimTypeMap.Clear();
+            JwtSecurityTokenHandler.DefaultInboundClaimTypeMap.Remove("sub");
 
-            var identityUrl = Configuration.GetValue<string>("IdentityUrl"); 
-                
+            var identityUrl = Configuration.GetValue<string>("IdentityUrl");
+
             services.AddAuthentication(options =>
             {
                 options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
@@ -262,18 +271,12 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
         protected virtual void ConfigureAuth(IApplicationBuilder app)
         {
-            if (Configuration.GetValue<bool>("UseLoadTest"))
-            {
-                app.UseMiddleware<ByPassAuthMiddleware>();
-            }
-
             app.UseAuthentication();
+            app.UseAuthorization();
         }
 
         private void RegisterEventBus(IServiceCollection services)
         {
-            var subscriptionClientName = Configuration["SubscriptionClientName"];
-
             if (Configuration.GetValue<bool>("AzureServiceBusEnabled"))
             {
                 services.AddSingleton<IEventBus, EventBusServiceBus>(sp =>
@@ -281,16 +284,17 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
                     var serviceBusPersisterConnection = sp.GetRequiredService<IServiceBusPersisterConnection>();
                     var iLifetimeScope = sp.GetRequiredService<ILifetimeScope>();
                     var logger = sp.GetRequiredService<ILogger<EventBusServiceBus>>();
-                    var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();                    
+                    var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();
 
                     return new EventBusServiceBus(serviceBusPersisterConnection, logger,
-                        eventBusSubcriptionsManager, subscriptionClientName, iLifetimeScope);
+                        eventBusSubcriptionsManager, iLifetimeScope);
                 });
             }
             else
             {
                 services.AddSingleton<IEventBus, EventBusRabbitMQ>(sp =>
                 {
+                    var subscriptionClientName = Configuration["SubscriptionClientName"];
                     var rabbitMQPersistentConnection = sp.GetRequiredService<IRabbitMQPersistentConnection>();
                     var iLifetimeScope = sp.GetRequiredService<ILifetimeScope>();
                     var logger = sp.GetRequiredService<ILogger<EventBusRabbitMQ>>();
@@ -318,7 +322,7 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
             eventBus.Subscribe<ProductPriceChangedIntegrationEvent, ProductPriceChangedIntegrationEventHandler>();
             eventBus.Subscribe<OrderStartedIntegrationEvent, OrderStartedIntegrationEventHandler>();
-        }        
+        }
     }
 
     public static class CustomExtensionMethods
@@ -329,7 +333,7 @@ namespace Microsoft.eShopOnContainers.Services.Basket.API
 
             hcBuilder.AddCheck("self", () => HealthCheckResult.Healthy());
 
-            hcBuilder                
+            hcBuilder
                 .AddRedis(
                     configuration["ConnectionString"],
                     name: "redis-check",

@@ -13,11 +13,11 @@ namespace WebSPA.Infrastructure
 {
     public class WebContextSeed
     {
-        public static void Seed(IApplicationBuilder applicationBuilder, IHostingEnvironment env, ILoggerFactory loggerFactory)
+        public static void Seed(IApplicationBuilder applicationBuilder, IWebHostEnvironment env, ILoggerFactory loggerFactory)
         {
             var log = loggerFactory.CreateLogger<WebContextSeed>();
 
-            var settings = (AppSettings)applicationBuilder
+            var settings = applicationBuilder
                 .ApplicationServices.GetRequiredService<IOptions<AppSettings>>().Value;
 
             var useCustomizationData = settings.UseCustomizationData;
@@ -42,13 +42,17 @@ namespace WebSPA.Infrastructure
                 }
 
                 string imagePath = Path.Combine(webroot, "assets", "images");
+                if (!Directory.Exists(imagePath))
+                {
+                    Directory.CreateDirectory(imagePath);
+                }
                 string[] imageFiles = Directory.GetFiles(imagePath).Select(file => Path.GetFileName(file)).ToArray();
 
                 using (ZipArchive zip = ZipFile.Open(imagesZipFile, ZipArchiveMode.Read))
                 {
                     foreach (ZipArchiveEntry entry in zip.Entries)
                     {
-                        if (imageFiles.Contains(entry.Name))
+                        if (!imageFiles.Contains(entry.Name))
                         {
                             string destinationFilename = Path.Combine(imagePath, entry.Name);
                             if (File.Exists(destinationFilename))

@@ -1,22 +1,22 @@
-﻿using eShopOnContainers.WebSPA;
-using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.ApplicationInsights.ServiceFabric;
+using eShopOnContainers.WebSPA;
+using HealthChecks.UI.Client;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SpaServices.AngularCli;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Newtonsoft.Json.Serialization;
 using StackExchange.Redis;
 using System;
 using System.IO;
 using WebSPA.Infrastructure;
-using HealthChecks.UI.Client;
-using Microsoft.AspNetCore.Diagnostics.HealthChecks;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace eShopConContainers.WebSPA
 {
@@ -29,11 +29,8 @@ namespace eShopConContainers.WebSPA
 
         public IConfiguration Configuration { get; }
 
-        private IHostingEnvironment _hostingEnv;
-        public Startup(IHostingEnvironment env)
+        public Startup()
         {
-            _hostingEnv = env;
-
             var localPath = new Uri(Configuration["ASPNETCORE_URLS"])?.LocalPath ?? "/";
             Configuration["BaseUrl"] = localPath;
         }
@@ -46,9 +43,7 @@ namespace eShopConContainers.WebSPA
 
             services.AddHealthChecks()
                 .AddCheck("self", () => HealthCheckResult.Healthy())
-                .AddUrlGroup(new Uri(Configuration["PurchaseUrlHC"]), name: "purchaseapigw-check", tags: new string[] { "purchaseapigw" })
-                .AddUrlGroup(new Uri(Configuration["MarketingUrlHC"]), name: "marketingapigw-check", tags: new string[] { "marketingapigw" })
-                .AddUrlGroup(new Uri(Configuration["IdentityUrlHC"]), name: "identityapi-check", tags: new string[] { "identityapi" });                        
+                .AddUrlGroup(new Uri(Configuration["IdentityUrlHC"]), name: "identityapi-check", tags: new string[] { "identityapi" });
 
             services.Configure<AppSettings>(Configuration);
 
@@ -58,104 +53,112 @@ namespace eShopConContainers.WebSPA
                 {
                     opts.ApplicationDiscriminator = "eshop.webspa";
                 })
-                .PersistKeysToRedis(ConnectionMultiplexer.Connect(Configuration["DPConnectionString"]), "DataProtection-Keys");
+                .PersistKeysToStackExchangeRedis(ConnectionMultiplexer.Connect(Configuration["DPConnectionString"]), "DataProtection-Keys");
             }
 
+            // Add Antiforgery services and configure the header name that angular will use by default.
             services.AddAntiforgery(options => options.HeaderName = "X-XSRF-TOKEN");
 
-            services.AddMvc()
-                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2)
+            // Add controllers support and add a global AutoValidateAntiforgeryTokenFilter that will make the application check for an Antiforgery token on all "mutating" requests (POST, PUT, DELETE).
+            // The AutoValidateAntiforgeryTokenFilter is an internal class registered when we register views, so we need to register controllers and views also.
+            services.AddControllersWithViews(options => options.Filters.Add(new AutoValidateAntiforgeryTokenAttribute()))
                 .AddJsonOptions(options =>
                 {
-                    options.SerializerSettings.ContractResolver = new CamelCasePropertyNamesContractResolver();
+                    options.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
                 });
+
+            // Setup where the compiled version of our spa application will be, when in production. 
+            services.AddSpaStaticFiles(configuration =>
+            {
+                configuration.RootPath = "wwwroot";
+            });
         }
 
-
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
-        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory, IAntiforgery antiforgery)
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env, ILoggerFactory loggerFactory, IAntiforgery antiforgery)
         {
-            loggerFactory.AddApplicationInsights(app.ApplicationServices, LogLevel.Trace);
-
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();
             }
-            else
-            {
-                // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
-                app.UseHsts();
-            }
 
-            app.UseHealthChecks("/liveness", new HealthCheckOptions
+            // Here we add Angular default Antiforgery cookie name on first load. https://angular.io/guide/http#security-xsrf-protection
+            // This cookie will be read by Angular app and its value will be sent back to the application as the header configured in .AddAntiforgery()
+            app.Use(next => context =>
             {
-                Predicate = r => r.Name.Contains("self")
+                string path = context.Request.Path.Value;
+
+                if (
+                    string.Equals(path, "/", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(path, "/index.html", StringComparison.OrdinalIgnoreCase))
+                {
+                    // The request token has to be sent as a JavaScript-readable cookie, 
+                    // and Angular uses it by default.
+                    var tokens = antiforgery.GetAndStoreTokens(context);
+                    context.Response.Cookies.Append("XSRF-TOKEN", tokens.RequestToken,
+                        new CookieOptions() { HttpOnly = false });
+                }
+
+                return next(context);
             });
-
-            app.UseHealthChecks("/hc", new HealthCheckOptions()
-            {
-                Predicate = _ => true,
-                ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
-            });
-
-            // Configure XSRF middleware, This pattern is for SPA style applications where XSRF token is added on Index page 
-            // load and passed back token on every subsequent async request            
-            // app.Use(async (context, next) =>
-            // {
-            //     if (string.Equals(context.Request.Path.Value, "/", StringComparison.OrdinalIgnoreCase))
-            //     {
-            //         var tokens = antiforgery.GetAndStoreTokens(context);
-            //         context.Response.Cookies.Append("XSRF-TOKEN", tokens.RequestToken, new CookieOptions() { HttpOnly = false });
-            //     }
-            //     await next.Invoke();
-            // });
 
             //Seed Data
             WebContextSeed.Seed(app, env, loggerFactory);
 
             var pathBase = Configuration["PATH_BASE"];
+
             if (!string.IsNullOrEmpty(pathBase))
             {
                 loggerFactory.CreateLogger<Startup>().LogDebug("Using PATH BASE '{pathBase}'", pathBase);
                 app.UsePathBase(pathBase);
             }
 
-            app.Use(async (context, next) =>
-            {
-                await next();
-
-                // If there's no available file and the request doesn't contain an extension, we're probably trying to access a page.
-                // Rewrite request to use app root
-                if (context.Response.StatusCode == 404 && !Path.HasExtension(context.Request.Path.Value) && !context.Request.Path.Value.StartsWith("/api"))
-                {
-                    context.Request.Path = "/index.html"; 
-                    context.Response.StatusCode = 200; // Make sure we update the status code, otherwise it returns 404
-                    await next();
-                }
-            });
-            
             app.UseDefaultFiles();
             app.UseStaticFiles();
 
-            app.UseMvcWithDefaultRoute();
+            // this will make the application to respond with the index.html and the rest of the assets present on the configured folder (at AddSpaStaticFiles() (wwwroot))
+            if (!env.IsDevelopment())
+            {
+                app.UseSpaStaticFiles();
+            }
+            app.UseRouting();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapDefaultControllerRoute();
+                endpoints.MapControllers();
+                endpoints.MapHealthChecks("/liveness", new HealthCheckOptions
+                {
+                    Predicate = r => r.Name.Contains("self")
+                });
+                endpoints.MapHealthChecks("/hc", new HealthCheckOptions()
+                {
+                    Predicate = _ => true,
+                    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+                });
+            });
+
+            // Handles all still unnatended (by any other middleware) requests by returning the default page of the SPA (wwwroot/index.html).
+            app.UseSpa(spa =>
+            {
+                // To learn more about options for serving an Angular SPA from ASP.NET Core,
+                // see https://go.microsoft.com/fwlink/?linkid=864501
+
+                // the root of the angular app. (Where the package.json lives)
+                spa.Options.SourcePath = "Client";
+
+                if (env.IsDevelopment())
+                { 
+
+                    // use the SpaServices extension method for angular, that will make the application to run "ng serve" for us, when in development.
+                    spa.UseAngularCliServer(npmScript: "start");
+                }
+            });
         }
 
         private void RegisterAppInsights(IServiceCollection services)
         {
             services.AddApplicationInsightsTelemetry(Configuration);
-            var orchestratorType = Configuration.GetValue<string>("OrchestratorType");
-
-            if (orchestratorType?.ToUpper() == "K8S")
-            {
-                // Enable K8s telemetry initializer
-                services.AddApplicationInsightsKubernetesEnricher();
-            }
-            if (orchestratorType?.ToUpper() == "SF")
-            {
-                // Enable SF telemetry initializer
-                services.AddSingleton<ITelemetryInitializer>((serviceProvider) =>
-                    new FabricTelemetryInitializer());
-            }
+            services.AddApplicationInsightsKubernetesEnricher();
         }
     }
 }

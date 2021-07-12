@@ -1,11 +1,10 @@
 ﻿using Basket.FunctionalTests.Base;
 using Microsoft.eShopOnContainers.Services.Basket.API.Model;
-using Newtonsoft.Json;
 using System;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
-using WebMVC.Services.ModelDTOs;
 using Xunit;
 
 namespace Basket.FunctionalTests
@@ -63,18 +62,18 @@ namespace Basket.FunctionalTests
 
             order.Items.Add(new BasketItem
             {
-                ProductId = "1",
+                ProductId = 1,
                 ProductName = ".NET Bot Black Hoodie",
                 UnitPrice = 10,
                 Quantity = 1
             });
 
-            return JsonConvert.SerializeObject(order);
+            return JsonSerializer.Serialize(order);
         }
 
         string BuildCheckout()
         {
-            var checkoutBasket = new BasketDTO()
+            var checkoutBasket = new
             {
                 City = "city",
                 Street = "street",
@@ -90,7 +89,7 @@ namespace Basket.FunctionalTests
                 RequestId = Guid.NewGuid()
             };
 
-            return JsonConvert.SerializeObject(checkoutBasket);
+            return JsonSerializer.Serialize(checkoutBasket);
         }
     }
 }

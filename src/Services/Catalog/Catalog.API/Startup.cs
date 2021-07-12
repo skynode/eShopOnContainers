@@ -1,16 +1,16 @@
 ﻿using Autofac;
 using Autofac.Extensions.DependencyInjection;
+using Catalog.API.Grpc;
 using global::Catalog.API.Infrastructure.Filters;
 using global::Catalog.API.IntegrationEvents;
-using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.ApplicationInsights.ServiceFabric;
+using HealthChecks.UI.Client;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.ServiceBus;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ;
@@ -22,15 +22,15 @@ using Microsoft.eShopOnContainers.Services.Catalog.API.IntegrationEvents.EventHa
 using Microsoft.eShopOnContainers.Services.Catalog.API.IntegrationEvents.Events;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.OpenApi.Models;
 using RabbitMQ.Client;
 using System;
 using System.Data.Common;
+using System.IO;
 using System.Reflection;
-using HealthChecks.UI.Client;
-using Microsoft.AspNetCore.Diagnostics.HealthChecks;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace Microsoft.eShopOnContainers.Services.Catalog.API
 {
@@ -46,21 +46,22 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
         public IServiceProvider ConfigureServices(IServiceCollection services)
         {
             services.AddAppInsight(Configuration)
+                .AddGrpc().Services
                 .AddCustomMVC(Configuration)
                 .AddCustomDbContext(Configuration)
                 .AddCustomOptions(Configuration)
                 .AddIntegrationServices(Configuration)
                 .AddEventBus(Configuration)
-                .AddSwagger()
+                .AddSwagger(Configuration)
                 .AddCustomHealthCheck(Configuration);
 
             var container = new ContainerBuilder();
             container.Populate(services);
-            return new AutofacServiceProvider(container.Build());
 
+            return new AutofacServiceProvider(container.Build());
         }
 
-        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory)
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env, ILoggerFactory loggerFactory)
         {
             //Configure logs
 
@@ -75,26 +76,43 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
                 app.UsePathBase(pathBase);
             }
 
-            app.UseHealthChecks("/hc", new HealthCheckOptions()
-            {
-                Predicate = _ => true,
-                ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
-            });
-
-            app.UseHealthChecks("/liveness", new HealthCheckOptions
-            {
-                Predicate = r => r.Name.Contains("self")
-            });
-
-            app.UseCors("CorsPolicy");
-
-            app.UseMvcWithDefaultRoute();
-
             app.UseSwagger()
-              .UseSwaggerUI(c =>
-              {
-                  c.SwaggerEndpoint($"{ (!string.IsNullOrEmpty(pathBase) ? pathBase : string.Empty) }/swagger/v1/swagger.json", "Catalog.API V1");
-              });
+             .UseSwaggerUI(c =>
+             {
+                 c.SwaggerEndpoint($"{ (!string.IsNullOrEmpty(pathBase) ? pathBase : string.Empty) }/swagger/v1/swagger.json", "Catalog.API V1");
+             });
+
+            app.UseRouting();
+            app.UseCors("CorsPolicy");
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapDefaultControllerRoute();
+                endpoints.MapControllers();
+                endpoints.MapGet("/_proto/", async ctx =>
+                {
+                    ctx.Response.ContentType = "text/plain";
+                    using var fs = new FileStream(Path.Combine(env.ContentRootPath, "Proto", "catalog.proto"), FileMode.Open, FileAccess.Read);
+                    using var sr = new StreamReader(fs);
+                    while (!sr.EndOfStream)
+                    {
+                        var line = await sr.ReadLineAsync();
+                        if (line != "/* >>" || line != "<< */")
+                        {
+                            await ctx.Response.WriteAsync(line);
+                        }
+                    }
+                });
+                endpoints.MapGrpcService<CatalogService>();
+                endpoints.MapHealthChecks("/hc", new HealthCheckOptions()
+                {
+                    Predicate = _ => true,
+                    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+                });
+                endpoints.MapHealthChecks("/liveness", new HealthCheckOptions
+                {
+                    Predicate = r => r.Name.Contains("self")
+                });
+            });
 
             ConfigureEventBus(app);
         }
@@ -112,31 +130,18 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
         public static IServiceCollection AddAppInsight(this IServiceCollection services, IConfiguration configuration)
         {
             services.AddApplicationInsightsTelemetry(configuration);
-            var orchestratorType = configuration.GetValue<string>("OrchestratorType");
-
-            if (orchestratorType?.ToUpper() == "K8S")
-            {
-                // Enable K8s telemetry initializer
-                services.AddApplicationInsightsKubernetesEnricher();
-            }
-            if (orchestratorType?.ToUpper() == "SF")
-            {
-                // Enable SF telemetry initializer
-                services.AddSingleton<ITelemetryInitializer>((serviceProvider) =>
-                    new FabricTelemetryInitializer());
-            }
+            services.AddApplicationInsightsKubernetesEnricher();
 
             return services;
         }
 
         public static IServiceCollection AddCustomMVC(this IServiceCollection services, IConfiguration configuration)
-        {                                        
-            services.AddMvc(options =>
-                {
-                    options.Filters.Add(typeof(HttpGlobalExceptionFilter));
-                })
-                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2)
-                .AddControllersAsServices();
+        {
+            services.AddControllers(options =>
+            {
+                options.Filters.Add(typeof(HttpGlobalExceptionFilter));
+            })
+            .AddJsonOptions(options => options.JsonSerializerOptions.WriteIndented = true);
 
             services.AddCors(options =>
             {
@@ -166,7 +171,7 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
                     tags: new string[] { "catalogdb" });
 
             if (!string.IsNullOrEmpty(accountName) && !string.IsNullOrEmpty(accountKey))
-            {                
+            {
                 hcBuilder
                     .AddAzureBlobStorage(
                         $"DefaultEndpointsProtocol=https;AccountName={accountName};AccountKey={accountKey};EndpointSuffix=core.windows.net",
@@ -197,20 +202,16 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
 
         public static IServiceCollection AddCustomDbContext(this IServiceCollection services, IConfiguration configuration)
         {
-            services.AddDbContext<CatalogContext>(options =>
+            services.AddEntityFrameworkSqlServer()
+                .AddDbContext<CatalogContext>(options =>
             {
                 options.UseSqlServer(configuration["ConnectionString"],
                                      sqlServerOptionsAction: sqlOptions =>
                                      {
                                          sqlOptions.MigrationsAssembly(typeof(Startup).GetTypeInfo().Assembly.GetName().Name);
                                          //Configuring Connection Resiliency: https://docs.microsoft.com/en-us/ef/core/miscellaneous/connection-resiliency 
-                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 10, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
+                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 15, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
                                      });
-
-                // Changing default behavior when client evaluation occurs to throw. 
-                // Default in EF Core would be to log a warning when client evaluation is performed.
-                options.ConfigureWarnings(warnings => warnings.Throw(RelationalEventId.QueryClientEvaluationWarning));
-                //Check Client vs. Server evaluation: https://docs.microsoft.com/en-us/ef/core/querying/client-eval
             });
 
             services.AddDbContext<IntegrationEventLogContext>(options =>
@@ -220,7 +221,7 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
                                      {
                                          sqlOptions.MigrationsAssembly(typeof(Startup).GetTypeInfo().Assembly.GetName().Name);
                                          //Configuring Connection Resiliency: https://docs.microsoft.com/en-us/ef/core/miscellaneous/connection-resiliency 
-                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 10, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
+                                         sqlOptions.EnableRetryOnFailure(maxRetryCount: 15, maxRetryDelay: TimeSpan.FromSeconds(30), errorNumbersToAdd: null);
                                      });
             });
 
@@ -251,17 +252,16 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
             return services;
         }
 
-        public static IServiceCollection AddSwagger(this IServiceCollection services)
+        public static IServiceCollection AddSwagger(this IServiceCollection services, IConfiguration configuration)
         {
             services.AddSwaggerGen(options =>
             {
                 options.DescribeAllEnumsAsStrings();
-                options.SwaggerDoc("v1", new Swashbuckle.AspNetCore.Swagger.Info
+                options.SwaggerDoc("v1", new OpenApiInfo
                 {
                     Title = "eShopOnContainers - Catalog HTTP API",
                     Version = "v1",
-                    Description = "The Catalog Microservice HTTP API. This is a Data-Driven/CRUD microservice sample",
-                    TermsOfService = "Terms Of Service"
+                    Description = "The Catalog Microservice HTTP API. This is a Data-Driven/CRUD microservice sample"
                 });
             });
 
@@ -281,11 +281,10 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
                 services.AddSingleton<IServiceBusPersisterConnection>(sp =>
                 {
                     var settings = sp.GetRequiredService<IOptions<CatalogSettings>>().Value;
-                    var logger = sp.GetRequiredService<ILogger<DefaultServiceBusPersisterConnection>>();
-
                     var serviceBusConnection = new ServiceBusConnectionStringBuilder(settings.EventBusConnection);
+                    var subscriptionClientName = configuration["SubscriptionClientName"];
 
-                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, logger);
+                    return new DefaultServiceBusPersisterConnection(serviceBusConnection, subscriptionClientName);
                 });
             }
             else
@@ -326,8 +325,6 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
 
         public static IServiceCollection AddEventBus(this IServiceCollection services, IConfiguration configuration)
         {
-            var subscriptionClientName = configuration["SubscriptionClientName"];
-
             if (configuration.GetValue<bool>("AzureServiceBusEnabled"))
             {
                 services.AddSingleton<IEventBus, EventBusServiceBus>(sp =>
@@ -338,7 +335,7 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
                     var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();
 
                     return new EventBusServiceBus(serviceBusPersisterConnection, logger,
-                        eventBusSubcriptionsManager, subscriptionClientName, iLifetimeScope);
+                        eventBusSubcriptionsManager, iLifetimeScope);
                 });
 
             }
@@ -346,6 +343,7 @@ namespace Microsoft.eShopOnContainers.Services.Catalog.API
             {
                 services.AddSingleton<IEventBus, EventBusRabbitMQ>(sp =>
                 {
+                    var subscriptionClientName = configuration["SubscriptionClientName"];
                     var rabbitMQPersistentConnection = sp.GetRequiredService<IRabbitMQPersistentConnection>();
                     var iLifetimeScope = sp.GetRequiredService<ILifetimeScope>();
                     var logger = sp.GetRequiredService<ILogger<EventBusRabbitMQ>>();
